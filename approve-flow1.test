@@ -1,0 +1,290 @@
+// This will be a full Laravel modular structure for large-scale multi-level approval system
+// Supporting: 5-level approval, forward/revert, logging, visibility restriction, unit tests
+
+// === STEP 1: MIGRATIONS ===
+
+// create_applications_table.php
+Schema::create('applications', function (Blueprint $table) {
+    $table->id();
+    $table->string('application_no')->unique();
+    $table->unsignedBigInteger('user_id');
+    $table->string('status')->default('pending');
+    $table->string('current_role');
+    $table->unsignedBigInteger('submitted_to_user_id')->nullable();
+    $table->timestamps();
+});
+
+// create_application_flows_table.php
+Schema::create('application_flows', function (Blueprint $table) {
+    $table->id();
+    $table->unsignedBigInteger('application_id');
+    $table->string('from_role');
+    $table->string('to_role')->nullable();
+    $table->string('action'); // approve, reject, revert, send_bco
+    $table->text('remarks')->nullable();
+    $table->json('attachments')->nullable();
+    $table->boolean('is_action_taken')->default(true);
+    $table->unsignedBigInteger('acted_by');
+    $table->unsignedBigInteger('to_user_id')->nullable();
+    $table->timestamps();
+});
+
+// === STEP 2: MODELS ===
+
+class Application extends Model {
+    protected $fillable = ['application_no', 'user_id', 'status', 'current_role', 'submitted_to_user_id'];
+
+    public function flows() {
+        return $this->hasMany(ApplicationFlow::class);
+    }
+}
+
+class ApplicationFlow extends Model {
+    protected $fillable = [
+        'application_id', 'from_role', 'to_role', 'action', 'remarks', 'attachments', 'is_action_taken', 'acted_by', 'to_user_id'
+    ];
+
+    protected $casts = [
+        'attachments' => 'array',
+    ];
+
+    public function application() {
+        return $this->belongsTo(Application::class);
+    }
+}
+
+// === STEP 3: POLICY ===
+
+class ApplicationPolicy {
+    public function view(User $user, Application $app) {
+        return $app->current_role === $user->role ||
+            $app->submitted_to_user_id === $user->id ||
+            $app->flows()->where(function ($q) use ($user) {
+                $q->where('from_role', $user->role)->orWhere('to_role', $user->role);
+            })->exists();
+    }
+
+    public function act(User $user, Application $app) {
+        return $app->current_role === $user->role && ($app->submitted_to_user_id === null || $app->submitted_to_user_id === $user->id);
+    }
+}
+
+// === STEP 4: CONTROLLER ===
+
+class ApplicationController extends Controller
+{
+    protected $flowService;
+
+    public function __construct(ApplicationFlowService $flowService)
+    {
+        $this->flowService = $flowService;
+    }
+
+    public function index() {
+        $user = auth()->user();
+        $appIds = ApplicationFlow::where(function ($q) use ($user) {
+            $q->where('from_role', $user->role)->orWhere('to_role', $user->role);
+        })->pluck('application_id')->unique();
+
+        $apps = Application::whereIn('id', $appIds)
+            ->orWhere('current_role', $user->role)
+            ->orWhere('submitted_to_user_id', $user->id)
+            ->paginate(50);
+
+        return view('applications.index', compact('apps'));
+    }
+
+    public function show($id) {
+        $app = Application::with('flows')->findOrFail($id);
+        $this->authorize('view', $app);
+
+        return view('applications.show', compact('app'));
+    }
+
+    public function approve(Request $request, $id) {
+        $app = Application::findOrFail($id);
+        $this->authorize('act', $app);
+
+        $this->flowService->approve($app, $request);
+
+        return redirect()->route('applications.index')->with('success', 'Application approved.');
+    }
+
+    public function reject(Request $request, $id) {
+        $app = Application::findOrFail($id);
+        $this->authorize('act', $app);
+
+        $this->flowService->reject($app, $request);
+
+        return redirect()->route('applications.index')->with('success', 'Application rejected.');
+    }
+
+    public function revert(Request $request, $id) {
+        $app = Application::findOrFail($id);
+        $this->authorize('act', $app);
+
+        $this->flowService->revert($app, $request);
+
+        return redirect()->route('applications.index')->with('success', 'Application reverted to applicant.');
+    }
+
+    public function sendToBco(Request $request, $id) {
+        $app = Application::findOrFail($id);
+        $this->authorize('act', $app);
+
+        $this->flowService->sendToBco($app, $request);
+
+        return redirect()->route('applications.index')->with('success', 'Sent to BCO for field verification.');
+    }
+}
+
+// === STEP 5: SERVICE ===
+
+class ApplicationFlowService {
+    public function approve(Application $app, Request $request) {
+        DB::transaction(function () use ($app, $request) {
+            ApplicationFlow::create([
+                'application_id' => $app->id,
+                'from_role' => $app->current_role,
+                'to_role' => $request->to_role,
+                'to_user_id' => $request->to_user_id,
+                'action' => 'approve',
+                'remarks' => $request->remarks,
+                'acted_by' => auth()->id(),
+            ]);
+
+            $app->update([
+                'current_role' => $request->to_role,
+                'submitted_to_user_id' => $request->to_user_id,
+                'status' => $request->to_role === 'final' ? 'approved' : 'pending',
+            ]);
+        });
+    }
+
+    public function reject(Application $app, Request $request) {
+        DB::transaction(function () use ($app, $request) {
+            ApplicationFlow::create([
+                'application_id' => $app->id,
+                'from_role' => $app->current_role,
+                'action' => 'reject',
+                'remarks' => $request->remarks,
+                'acted_by' => auth()->id(),
+            ]);
+
+            $app->update(['status' => 'rejected']);
+        });
+    }
+
+    public function revert(Application $app, Request $request) {
+        DB::transaction(function () use ($app, $request) {
+            ApplicationFlow::create([
+                'application_id' => $app->id,
+                'from_role' => $app->current_role,
+                'to_role' => 'applicant',
+                'action' => 'revert',
+                'remarks' => $request->remarks,
+                'acted_by' => auth()->id(),
+            ]);
+
+            $app->update([
+                'current_role' => 'applicant',
+                'submitted_to_user_id' => null,
+                'status' => 'reverted',
+            ]);
+        });
+    }
+
+    public function sendToBco(Application $app, Request $request) {
+        DB::transaction(function () use ($app, $request) {
+            ApplicationFlow::create([
+                'application_id' => $app->id,
+                'from_role' => $app->current_role,
+                'to_role' => 'bco',
+                'action' => 'send_bco',
+                'remarks' => $request->remarks,
+                'acted_by' => auth()->id(),
+            ]);
+
+            $app->update([
+                'current_role' => 'bco',
+                'submitted_to_user_id' => null,
+                'status' => 'under_verification',
+            ]);
+        });
+    }
+}
+
+// === STEP 6: VIEWS (Blade) ===
+
+// applications/index.blade.php
+@foreach($apps as $app)
+    <tr>
+        <td>{{ $app->application_no }}</td>
+        <td>{{ $app->status }}</td>
+        <td><a href="{{ route('applications.show', $app->id) }}">View</a></td>
+    </tr>
+@endforeach
+
+// applications/show.blade.php
+<h3>Application #{{ $app->application_no }}</h3>
+<p>Status: {{ $app->status }}</p>
+<p>Current Role: {{ $app->current_role }}</p>
+
+@if(auth()->user()->role === $app->current_role && ($app->submitted_to_user_id === null || $app->submitted_to_user_id === auth()->id()))
+<form method="POST" action="{{ route('applications.approve', $app->id) }}">
+    @csrf
+    <input type="text" name="to_role" placeholder="Next Role" required>
+    <input type="text" name="to_user_id" placeholder="Next User ID (optional)">
+    <textarea name="remarks" placeholder="Remarks"></textarea>
+    <button type="submit">Approve</button>
+</form>
+@endif
+
+// === STEP 7: UNIT TESTS ===
+
+class ApplicationApprovalTest extends TestCase
+{
+    use RefreshDatabase;
+
+    public function test_user_can_see_only_visible_applications() {
+        // create roles, users, application, flow data...
+        // assert index returns correct apps based on user role and submitted_to_user_id
+    }
+
+    public function test_only_current_role_and_user_can_approve() {
+        // setup: app with current_role = DCO, submitted_to_user_id = specific user
+        // login as wrong role or wrong user, assertForbidden
+        // login as correct user/role, assert approval works
+    }
+
+    public function test_flow_record_created_on_approval() {
+        // approve an app, check flow record created with to_user_id
+    }
+
+    public function test_send_to_bco_sets_correct_status_and_clears_user() {
+        // verify that send_bco updates status and resets submitted_to_user_id
+    }
+
+    public function test_revert_returns_to_applicant_and_clears_user() {
+        // verify revert sets current_role to applicant and clears submitted_to_user_id
+    }
+}
+
+// === STEP 8: SERVICE PROVIDER (for policy binding) ===
+
+Gate::policy(Application::class, ApplicationPolicy::class);
+Application::where('submitted_to_role_id', auth()->user()->role_id)
+    ->where(function ($query) {
+        $user = auth()->user();
+        if ($user->role->slug === 'jrcs') {
+            $query->where('division_id', $user->division_id);
+        } elseif ($user->role->slug === 'dco') {
+            $query->where('district_id', $user->district_id);
+        } elseif ($user->role->slug === 'arcs') {
+            $query->where('block_id', $user->block_id);
+        }
+    })
+    ->where(function ($q) {
+        $q->whereNull('submitted_to_user_id')
+          ->orWhere('submitted_to_user_id', auth()->id());
+    })
