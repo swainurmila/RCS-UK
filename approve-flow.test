@@ -1,0 +1,115 @@
+CREATE TABLE applications (
+    id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+    user_id BIGINT UNSIGNED NOT NULL, -- applicant
+    module_id BIGINT UNSIGNED NOT NULL, -- for 12-module support
+    status ENUM('draft', 'under_review', 'approved', 'rejected') DEFAULT 'under_review',
+    current_role VARCHAR(50), -- who's handling it now (admin, jrcs, etc.)
+    current_user_id BIGINT UNSIGNED NULL, -- optional: specific user
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP
+);
+CREATE TABLE application_flows (
+    id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+    application_id BIGINT UNSIGNED NOT NULL,
+    from_role VARCHAR(50) NOT NULL,
+    from_user_id BIGINT UNSIGNED,
+    to_role VARCHAR(50),
+    to_user_id BIGINT UNSIGNED,
+    direction ENUM('forward', 'reverse') DEFAULT 'forward',
+    action ENUM('send', 'approve', 'reject', 'revert', 'field_verified') NOT NULL,
+    remarks TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE bco_field_reports (
+    id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+    application_id BIGINT UNSIGNED NOT NULL,
+    bco_user_id BIGINT UNSIGNED NOT NULL,
+    block_id BIGINT UNSIGNED NOT NULL,
+    answers JSON,
+    attachments JSON, -- file URLs
+    remarks TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE application_status_logs (
+    id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+    application_id BIGINT UNSIGNED NOT NULL,
+    old_status VARCHAR(50),
+    new_status VARCHAR(50),
+    changed_by_role VARCHAR(50),
+    changed_by_user BIGINT UNSIGNED,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+Schema::create('applications', function (Blueprint $table) {
+    $table->id();
+    $table->foreignId('user_id')->constrained()->onDelete('cascade');
+    $table->unsignedBigInteger('module_id');
+    $table->enum('status', ['draft', 'under_review', 'approved', 'rejected'])->default('under_review');
+    $table->string('current_role')->nullable(); // admin, jrcs, etc.
+    $table->unsignedBigInteger('current_user_id')->nullable();
+    $table->timestamps();
+});
+Schema::create('application_flows', function (Blueprint $table) {
+    $table->id();
+    $table->foreignId('application_id')->constrained()->onDelete('cascade');
+    $table->string('from_role');
+    $table->unsignedBigInteger('from_user_id')->nullable();
+    $table->string('to_role')->nullable();
+    $table->unsignedBigInteger('to_user_id')->nullable();
+    $table->enum('direction', ['forward', 'reverse'])->default('forward');
+    $table->enum('action', ['send', 'approve', 'reject', 'revert', 'field_verified']);
+    $table->text('remarks')->nullable();
+    $table->timestamps();
+});
+Schema::create('bco_field_reports', function (Blueprint $table) {
+    $table->id();
+    $table->foreignId('application_id')->constrained()->onDelete('cascade');
+    $table->unsignedBigInteger('bco_user_id');
+    $table->unsignedBigInteger('block_id');
+    $table->json('answers')->nullable();
+    $table->json('attachments')->nullable(); // file paths
+    $table->text('remarks')->nullable();
+    $table->timestamps();
+});
+
+
+$role = auth()->user()->role;
+
+$visibleAppIds = ApplicationFlow::where(function ($q) use ($role) {
+    $q->where('from_role', $role)->orWhere('to_role', $role);
+})->pluck('application_id')->unique();
+
+$applications = Application::whereIn('id', $visibleAppIds)
+    ->orWhere('current_role', $role)
+    ->latest()
+    ->paginate(20);
+
+public function approve(Request $request, $id)
+{
+    $app = Application::findOrFail($id);
+    $user = auth()->user();
+
+    if ($app->current_role !== $user->role) {
+        abort(403, 'You are not allowed to act on this application.');
+    }
+
+    // Proceed with approval logic...
+}
+
+@if($application->current_role === auth()->user()->role)
+    {{-- Show action buttons like Approve, Reject, Send to BCO --}}
+@else
+    <div class="text-muted">You have view-only access.</div>
+@endif
+
+
+php artisan make:policy ApplicationPolicy --model=Application
+
+public function act(User $user, Application $app)
+{
+    return $user->role === $app->current_role;
+}
+
+//controller
+$this->authorize('act', $application);
